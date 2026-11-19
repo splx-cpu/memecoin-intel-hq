@@ -1,0 +1,64 @@
+# Re-checks tokens already on the watchlist.
+#
+# WHY EVERY 5 MINUTES AND NOT EVERY MINUTE
+# GitHub Actions enforces a 5-minute minimum on cron, and scheduled runs are
+# frequently delayed when GitHub is busy - 5 to 15 minutes late is normal.
+# That is the trade for free compute. If you later want true 1-minute
+# scanning, run src/mihq/worker.py as a long-lived process on any always-on
+# machine instead; the code is identical.
+#
+# PUBLIC REPO NOTE
+# Actions minutes are unlimited on public repositories. Every credential
+# lives in Settings -> Secrets and variables -> Actions, never in this file
+# or anywhere else in the repo.
+
+name: Watchlist scan
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:        # lets you trigger a run by hand from the Actions tab
+
+# If a run overruns, skip the next one rather than stacking them up. Two
+# scanners writing at once would waste API quota on duplicate work.
+concurrency:
+  group: watchlist
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # Installs the project itself so `python -m mihq.worker` resolves.
+          # Without this the run fails with ModuleNotFoundError: No module
+          # named 'mihq' - the helper scripts patch sys.path themselves, but
+          # `python -m` does not.
+          pip install -e .
+
+      - name: Run watchlist scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Only needed if you switch ANALYSIS_MODE to claude.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANALYSIS_MODE: ${{ vars.ANALYSIS_MODE || 'template' }}
+          ENABLED_CHAINS: ${{ vars.ENABLED_CHAINS || 'solana,base' }}
+          # Match the real cadence so the scanner does not think every token
+          # is overdue on each run.
+          WATCHLIST_INTERVAL_SECONDS: "300"
+          LOG_FORMAT: json
+          APP_ENV: prod
+        run: python -m mihq.worker --watchlist

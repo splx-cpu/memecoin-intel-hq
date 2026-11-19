@@ -1,0 +1,51 @@
+# Finds newly created pools.
+#
+# Runs less often than the watchlist because new pools appear continuously
+# and a 15-minute cadence is plenty to catch them, while using a third of
+# the API calls.
+
+name: Discovery scan
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: discovery
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # Installs the project itself so `python -m mihq.worker` resolves.
+          # Without this the run fails with ModuleNotFoundError: No module
+          # named 'mihq' - the helper scripts patch sys.path themselves, but
+          # `python -m` does not.
+          pip install -e .
+
+      - name: Run discovery scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANALYSIS_MODE: ${{ vars.ANALYSIS_MODE || 'template' }}
+          ENABLED_CHAINS: ${{ vars.ENABLED_CHAINS || 'solana,base' }}
+          DISCOVERY_INTERVAL_SECONDS: "900"
+          LOG_FORMAT: json
+          APP_ENV: prod
+        run: python -m mihq.worker --discovery

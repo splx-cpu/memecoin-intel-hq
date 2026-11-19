@@ -1,0 +1,21 @@
+# Runtime dependencies for MemeCoin Intelligence HQ
+# Install with:  pip install -r requirements.txt
+#
+# Lower bounds (>=) are used rather than exact pins so you get security fixes.
+# If a future version ever breaks the build, pin the working version here.
+
+# HTTP client for market data providers and the Telegram Bot API
+requests>=2.32
+
+# Loads the .env file into environment variables
+python-dotenv>=1.0
+
+# PostgreSQL driver (psycopg 3). The [binary] extra ships a prebuilt wheel so
+# you do NOT need a C compiler or local Postgres install.
+psycopg[binary]>=3.1
+
+# Official Claude API client (used from Stage E onward)
+anthropic>=0.40
+
+# Timezone database. Needed on Windows, where Python has no system tz data.
+tzdata>=2024.1

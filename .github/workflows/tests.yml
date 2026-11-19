@@ -1,0 +1,44 @@
+# Runs the test suite on every push and pull request.
+#
+# No secrets are referenced here on purpose: the whole suite runs offline
+# with no database and no network, so a fork or a pull request can run it
+# safely. That is also why it can stay green on a public repository.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Check no credentials were committed
+        run: |
+          echo "Scanning the repo for credential-shaped strings..."
+          if grep -rInE '(sk-ant-[A-Za-z0-9_-]{10,}|[0-9]{6,12}:[A-Za-z0-9_-]{30,}|postgres(ql)?://[^:]+:[^@]+@)' \
+               --exclude-dir=.git --exclude-dir=.github --exclude='*.md' . ; then
+            echo "::error::Something credential-shaped is committed. Remove it and rotate the credential."
+            exit 1
+          fi
+          echo "Clean."
