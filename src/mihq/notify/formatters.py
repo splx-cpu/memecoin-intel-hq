@@ -222,6 +222,13 @@ def format_daily_summary(
     lines.append("<b>System health</b>")
     runs = health.get("successful_runs")
     lines.append(f"  - Successful scanner runs: {runs if runs is not None else 'unknown'}")
+    # Printed only when non-zero, because a permanent "Failed: 0" line is
+    # one the eye learns to skip - and this is the line that most needs to
+    # be noticed on the day it is not zero.
+    if health.get("failed_runs"):
+        lines.append(f"  - FAILED scanner runs: {health['failed_runs']}")
+    if health.get("partial_runs"):
+        lines.append(f"  - Partial runs: {health['partial_runs']}")
     errors = health.get("provider_errors", 0)
     lines.append(f"  - Provider errors: {errors}")
     if health.get("last_success"):

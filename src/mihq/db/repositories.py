@@ -388,6 +388,128 @@ select flag_type, severity, detail, evidence, detected_at
 
 
 # ---------------------------------------------------------------------------
+# daily summaries
+# ---------------------------------------------------------------------------
+#
+# EVERY QUERY HERE TAKES A HALF-OPEN WINDOW [start, end).
+#
+# Not `now() - interval '24 hours'`. The summary covers a LOCAL CALENDAR DAY
+# in the configured timezone, and on the two DST changeover days that day is
+# 23 or 25 hours long. The window is computed in Python from the local
+# midnight boundaries (see `mihq.summary.day_window`) and passed in as two
+# UTC timestamps, so the SQL never has to know about any of that.
+#
+# Half-open matters: `>= start and < end` counts a row at exactly midnight
+# once, in the day it begins. `between` would double-count it.
+
+# scanner_runs already accumulates per-pass counters, so the day's activity
+# is a SUM over rows we already wrote rather than a recount of the whole
+# snapshot table. Cheaper, and it reports what the scanner believed it did -
+# which is what a health summary should say.
+SQL_SUMMARY_RUN_TOTALS = """
+select scanner,
+       count(*)                                      as runs,
+       count(*) filter (where status = 'success')    as successful,
+       count(*) filter (where status = 'partial')    as partial,
+       count(*) filter (where status = 'failed')     as failed,
+       count(*) filter (where status = 'running')    as still_running,
+       coalesce(sum(tokens_seen), 0)                 as tokens_seen,
+       coalesce(sum(new_tokens), 0)                  as new_tokens,
+       coalesce(sum(snapshots_written), 0)           as snapshots_written,
+       coalesce(sum(events_created), 0)              as events_created,
+       coalesce(sum(events_suppressed), 0)           as events_suppressed,
+       coalesce(sum(alerts_sent), 0)                 as alerts_sent,
+       coalesce(sum(provider_errors), 0)             as provider_errors,
+       coalesce(sum(telegram_errors), 0)             as telegram_errors,
+       coalesce(sum(database_errors), 0)             as database_errors,
+       max(finished_at)                              as last_finished
+  from scanner_runs
+ where started_at >= %s and started_at < %s
+ group by scanner
+ order by scanner
+"""
+
+# Category and severity in one pass; the caller pivots it two ways.
+# Suppressed events are excluded because they were never shown to anyone,
+# and a summary that counts them would overstate the day.
+SQL_SUMMARY_ALERTS = """
+select category, severity, count(*)
+  from alert_events
+ where triggered_at >= %s and triggered_at < %s
+   and not is_suppressed
+ group by category, severity
+"""
+
+# The few events worth naming. Ordered by severity first so a quiet day with
+# one critical event leads with it rather than burying it under the newest.
+SQL_SUMMARY_HIGHLIGHTS = """
+select e.chain, t.symbol, t.token_address, e.event_type, e.severity,
+       e.triggered_at, e.payload
+  from alert_events e
+  left join tokens t on t.id = e.token_id
+ where e.triggered_at >= %s and e.triggered_at < %s
+   and not e.is_suppressed
+ order by case e.severity
+     when 'critical' then 0 when 'high' then 1 when 'medium' then 2
+     when 'low' then 3 else 4 end,
+     e.triggered_at desc
+ limit %s
+"""
+
+# Both halves of the delta in one statement. `removed_at` is null for an
+# active row, and a null fails the filter, so active rows simply do not count.
+SQL_SUMMARY_WATCHLIST_DELTA = """
+select count(*) filter (where added_at   >= %s and added_at   < %s) as added,
+       count(*) filter (where removed_at >= %s and removed_at < %s) as removed
+  from watchlists
+"""
+
+# Flags RAISED during the day. `detected_at` is deliberately preserved when a
+# flag is re-raised (see SQL_UPSERT_RISK_FLAG), so this counts first
+# detections, not repeats - which is what "new risks found today" means.
+SQL_SUMMARY_RISK_FLAGS_RAISED = """
+select flag_type, severity, count(*)
+  from risk_flags
+ where detected_at >= %s and detected_at < %s
+ group by flag_type, severity
+ order by count(*) desc
+"""
+
+# NOTE the deliberate omission: `status` is NOT in the update list.
+#
+# Re-running the job for a day that was already sent must refresh the numbers
+# WITHOUT resetting status to 'pending', because a 'pending' row would be
+# picked up and sent a second time. The returned status is therefore the
+# status already on file, which is exactly what the caller needs to decide
+# whether to send.
+SQL_UPSERT_DAILY_SUMMARY = """
+insert into daily_summaries (
+    summary_date, timezone, stats, narrative, report_ids, watchlist_changes, status
+) values (%s, %s, %s, %s, %s, %s, 'pending')
+on conflict (summary_date) do update set
+    timezone          = excluded.timezone,
+    stats             = excluded.stats,
+    narrative         = excluded.narrative,
+    report_ids        = excluded.report_ids,
+    watchlist_changes = excluded.watchlist_changes,
+    generated_at      = now()
+returning id, status, (xmax = 0) as was_new
+"""
+
+SQL_DAILY_SUMMARY_FOR_DATE = """
+select id, status, generated_at, telegram_message_id, narrative
+  from daily_summaries
+ where summary_date = %s
+"""
+
+SQL_MARK_DAILY_SUMMARY_SENT = """
+update daily_summaries
+   set status = %s, telegram_message_id = %s
+ where id = %s
+"""
+
+
+# ---------------------------------------------------------------------------
 # Helper types
 # ---------------------------------------------------------------------------
 
@@ -804,6 +926,92 @@ class Repository:
             cur.execute(SQL_STALE_RUNNING, (older_than_seconds,))
             return list(cur.fetchall())
 
+    # -- daily summaries -------------------------------------------------
+
+    def summary_run_totals(
+        self, start: datetime, end: datetime
+    ) -> list[dict[str, Any]]:
+        """Per-scanner totals for the window, one dict per scanner."""
+        columns = (
+            "scanner", "runs", "successful", "partial", "failed", "still_running",
+            "tokens_seen", "new_tokens", "snapshots_written", "events_created",
+            "events_suppressed", "alerts_sent", "provider_errors",
+            "telegram_errors", "database_errors", "last_finished",
+        )
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_SUMMARY_RUN_TOTALS, (start, end))
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    def summary_alerts(
+        self, start: datetime, end: datetime
+    ) -> list[tuple[str, str, int]]:
+        """(category, severity, count) for non-suppressed alerts."""
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_SUMMARY_ALERTS, (start, end))
+            return [(r[0], r[1], int(r[2])) for r in cur.fetchall()]
+
+    def summary_highlights(
+        self, start: datetime, end: datetime, limit: int = 5
+    ) -> list[tuple[Any, ...]]:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_SUMMARY_HIGHLIGHTS, (start, end, limit))
+            return list(cur.fetchall())
+
+    def summary_watchlist_delta(
+        self, start: datetime, end: datetime
+    ) -> tuple[int, int]:
+        """(added, removed) during the window."""
+        with self.conn.cursor() as cur:
+            # The window is needed twice: once for each filter.
+            cur.execute(SQL_SUMMARY_WATCHLIST_DELTA, (start, end, start, end))
+            row = cur.fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+    def summary_risk_flags_raised(
+        self, start: datetime, end: datetime
+    ) -> list[tuple[str, str, int]]:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_SUMMARY_RISK_FLAGS_RAISED, (start, end))
+            return [(r[0], r[1], int(r[2])) for r in cur.fetchall()]
+
+    def upsert_daily_summary(
+        self,
+        *,
+        summary_date: Any,
+        timezone_name: str,
+        stats: dict[str, Any],
+        narrative: str | None,
+        report_ids: list[int] | None = None,
+        watchlist_changes: dict[str, Any] | None = None,
+    ) -> tuple[int, str, bool]:
+        """Store the day's summary. Returns (id, status_on_file, was_new).
+
+        `status_on_file` is the status ALREADY recorded, not one this call
+        set - re-running for a day that was sent returns 'sent', which is how
+        the caller knows not to send it twice.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                SQL_UPSERT_DAILY_SUMMARY,
+                (summary_date, timezone_name, json.dumps(stats), narrative,
+                 json.dumps(report_ids or []),
+                 json.dumps(watchlist_changes or {})),
+            )
+            row = cur.fetchone()
+        return (int(row[0]), str(row[1]), bool(row[2]))
+
+    def daily_summary_for_date(self, summary_date: Any) -> tuple[Any, ...] | None:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_DAILY_SUMMARY_FOR_DATE, (summary_date,))
+            return cur.fetchone()
+
+    def mark_daily_summary_sent(
+        self, summary_id: int, *, status: str, telegram_message_id: int | None
+    ) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_MARK_DAILY_SUMMARY_SENT,
+                        (status, telegram_message_id, summary_id))
+
 
 # Every statement in this module, for the test that runs them all against a
 # real PostgreSQL server. Keeping this list beside the constants means a new
@@ -840,4 +1048,12 @@ ALL_STATEMENTS: dict[str, str] = {
     "SQL_UPSERT_RISK_FLAG": SQL_UPSERT_RISK_FLAG,
     "SQL_RESOLVE_ABSENT_RISK_FLAGS": SQL_RESOLVE_ABSENT_RISK_FLAGS,
     "SQL_ACTIVE_RISK_FLAGS": SQL_ACTIVE_RISK_FLAGS,
+    "SQL_SUMMARY_RUN_TOTALS": SQL_SUMMARY_RUN_TOTALS,
+    "SQL_SUMMARY_ALERTS": SQL_SUMMARY_ALERTS,
+    "SQL_SUMMARY_HIGHLIGHTS": SQL_SUMMARY_HIGHLIGHTS,
+    "SQL_SUMMARY_WATCHLIST_DELTA": SQL_SUMMARY_WATCHLIST_DELTA,
+    "SQL_SUMMARY_RISK_FLAGS_RAISED": SQL_SUMMARY_RISK_FLAGS_RAISED,
+    "SQL_UPSERT_DAILY_SUMMARY": SQL_UPSERT_DAILY_SUMMARY,
+    "SQL_DAILY_SUMMARY_FOR_DATE": SQL_DAILY_SUMMARY_FOR_DATE,
+    "SQL_MARK_DAILY_SUMMARY_SENT": SQL_MARK_DAILY_SUMMARY_SENT,
 }

@@ -102,6 +102,16 @@ class Worker:
                 )
         return results
 
+    def run_daily_summary(
+        self, *, for_date: Any = None, force: bool = False
+    ) -> Any:
+        """Build and send one day's summary. Defaults to yesterday, locally."""
+        from mihq.summary import DailySummaryJob
+
+        with connect(self.settings) as conn:
+            job = DailySummaryJob(self.settings, Repository(conn))
+            return job.run(for_date=for_date, force=force)
+
     def send_test_message(self) -> bool:
         """Prove the bot token and chat id work. Used by --test-telegram."""
         client = TelegramClient(self.settings)
@@ -191,6 +201,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Send one test message to confirm the bot works.")
     parser.add_argument("--no-notify", action="store_true",
                         help="Scan but do not send anything.")
+    parser.add_argument("--daily-summary", action="store_true",
+                        help="Build and send one day's summary, then exit.")
+    parser.add_argument("--for-date", metavar="YYYY-MM-DD",
+                        help="Which local calendar day to summarise. "
+                             "Defaults to yesterday in TIMEZONE.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-send a summary that was already sent.")
     args = parser.parse_args(argv)
 
     try:
@@ -204,6 +221,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.test_telegram:
         return 0 if worker.send_test_message() else 1
+
+    if args.daily_summary:
+        for_date = None
+        if args.for_date:
+            from datetime import date as _date
+            try:
+                for_date = _date.fromisoformat(args.for_date)
+            except ValueError:
+                print(f"\n--for-date must be YYYY-MM-DD, got {args.for_date!r}\n",
+                      file=sys.stderr)
+                return 1
+        result = worker.run_daily_summary(for_date=for_date, force=args.force)
+        print(result.describe())
+        for error in result.errors:
+            print(f"  ! {error}", file=sys.stderr)
+        # A summary that was stored but not sent is not a failed run - a dry
+        # run and an already-sent day both land here legitimately.
+        return 0 if result.stored else 1
 
     if args.notify:
         results = worker.run_once(which="notify", notify=True)

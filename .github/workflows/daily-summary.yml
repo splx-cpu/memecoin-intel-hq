@@ -1,0 +1,71 @@
+# The once-a-day digest.
+#
+# WHY THE CRON IS 13:00 UTC
+# -------------------------
+# 13:00 UTC is 08:00 in America/New_York during EST and 09:00 during EDT.
+# GitHub cron only speaks UTC, so one of the two is unavoidable; the summary
+# covers a completed calendar day, so an hour of drift changes nothing about
+# its contents.
+#
+# Scheduled workflows on free public repos are best-effort and routinely run
+# late - this repo has seen delays of up to an hour. That is harmless here:
+# the job summarises YESTERDAY, which is already over, so arriving late means
+# a late message, never a wrong one.
+#
+# TIMEZONE below must match the timezone the summary is reported in. If you
+# change one, change the other, or the message will claim a local date whose
+# boundaries were computed somewhere else.
+
+name: Daily summary
+
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      for_date:
+        description: "Local calendar day to summarise (YYYY-MM-DD). Blank = yesterday."
+        required: false
+        type: string
+      force:
+        description: "Re-send even if this date was already sent"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-summary
+  cancel-in-progress: false
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          # Installs the project itself so `python -m mihq.worker` resolves.
+          pip install -e .
+
+      - name: Send daily summary
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'America/New_York' }}
+          ENABLED_CHAINS: ${{ vars.ENABLED_CHAINS || 'solana,base' }}
+          LOG_FORMAT: json
+          APP_ENV: prod
+        run: |
+          python -m mihq.worker --daily-summary \
+            ${{ inputs.for_date && format('--for-date {0}', inputs.for_date) || '' }} \
+            ${{ inputs.force && '--force' || '' }}
