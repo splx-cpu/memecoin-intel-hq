@@ -46,13 +46,20 @@ class DispatchResult:
     failed: int = 0
     skipped: int = 0
     considered: int = 0
+    digest_only: int = 0
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        return (
+        line = (
             f"notifications: {self.sent} sent, {self.failed} failed, "
             f"{self.skipped} skipped (dry run), of {self.considered} pending"
         )
+        # Reported separately from `skipped`, which means DRY_RUN. These were
+        # stored and will appear in the daily summary; they were simply not
+        # worth interrupting anyone for.
+        if self.digest_only:
+            line += f"; {self.digest_only} held for the daily digest"
+        return line
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -99,9 +106,23 @@ class NotificationDispatcher:
     def dispatch_pending(self, limit: int = 10) -> DispatchResult:
         """Send up to `limit` pending alerts. Never raises."""
         result = DispatchResult()
+        digest_only = tuple(self.settings.notify_digest_only_categories)
+
+        # Clear these first and in one statement. They never enter the send
+        # queue, so a day's worth of new-token events cannot delay a
+        # liquidity-drain alert sitting behind them.
+        if digest_only:
+            try:
+                result.digest_only = self.repo.resolve_digest_only(digest_only)
+            except Exception as exc:  # noqa: BLE001 - housekeeping must not
+                                      # stop real alerts from going out
+                result.errors.append(f"resolve_digest_only failed: {exc}")
+                log.warning("could not resolve digest-only events",
+                            extra={"error": str(exc)})
 
         try:
-            pending = self.repo.pending_notification(limit)
+            pending = self.repo.pending_notification(
+                limit, exclude_categories=digest_only)
         except Exception as exc:  # noqa: BLE001
             log.error("could not read pending notifications",
                       extra={"error": str(exc)})
@@ -110,6 +131,8 @@ class NotificationDispatcher:
 
         result.considered = len(pending)
         if not pending:
+            if result.digest_only:
+                log.info(result.summary())
             return result
 
         for row in pending:

@@ -91,9 +91,12 @@ class FakeRepo:
         self.raw_flags.append(include_raw)
         return len(self.raw_flags)
 
-    def add_to_watchlist(self, token_id, *, category, reason=None, priority=100):
+    def add_to_watchlist(self, token_id, *, category, reason=None, priority=100,
+                         readd_cooldown_hours=0):
         self._check("add_to_watchlist")
         if token_id in self.watchlist:
+            return None
+        if readd_cooldown_hours and token_id in getattr(self, "recently_retired", ()):
             return None
         self.watchlist[token_id] = {"category": category, "priority": priority,
                                     "reason": reason, "failures": 0, "active": True}
@@ -189,6 +192,9 @@ class FakeDex:
 
 def observation(chain="base", address=None, source="geckoterminal", **metrics):
     address = address or ("0x" + "a" * 40)
+    # Default to a pool large enough to clear the watchlist floor. Tests that
+    # care about the floor pass their own figure.
+    metrics.setdefault("liquidity_usd", 50_000.0)
     return MarketObservation(
         token=TokenRef(chain=chain, address=address, symbol="TEST"),
         source=source,

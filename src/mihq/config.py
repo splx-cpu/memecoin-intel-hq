@@ -200,8 +200,47 @@ class Settings:
     snapshot_heartbeat_seconds: int = 900
     snapshot_raw_mode: str = "events_only"
 
+    # --- Which categories are worth interrupting you for ----------------
+    # Categories listed here are still detected, stored, and counted in the
+    # daily summary - they simply never push to Telegram.
+    #
+    # `new_coin` is here by default because "a new pool exists" is a FEED,
+    # not an alert. Measured on real data: 545 a day at a $1,000 floor, and
+    # still 108 a day at $100,000. No threshold makes that a readable number
+    # of push notifications, because the volume is real. Risk and momentum
+    # events were about 10 a day over the same period, which is readable.
+    notify_digest_only_categories: tuple[str, ...] = field(
+        default_factory=lambda: ("new_coin",)
+    )
+
+    # --- Watchlist retirement (see mihq.scanners.retire) ----------------
+    # Without these the watchlist only ever grows, and every entry costs API
+    # calls and database rows on every pass, forever.
+    # What is worth watching in the first place. Until now the only gate was
+    # "have we seen this token before", so EVERY discovered pool joined the
+    # watchlist at any size - which is how it reached 2,367 entries in two
+    # days. Retirement alone only churns against that inflow.
+    watchlist_min_liquidity_usd: float = 10_000.0
+
+    # How long a retired token stays off the list before discovery may add it
+    # again. Without this, a token retired for being uneventful but still
+    # well funded would be re-added on the very next discovery pass, and
+    # bounce between states forever.
+    watchlist_readd_cooldown_hours: int = 168   # one week
+
+    watchlist_retire_enabled: bool = True
+    watchlist_retire_below_liquidity_usd: float = 2_000.0
+    watchlist_retire_grace_hours: int = 6
+    watchlist_retire_uneventful_hours: int = 72
+
     # --- Event detection thresholds (see mihq.events.detectors) ---------
     event_min_liquidity_usd: float = 5_000.0
+    # The new-token floor is SEPARATE from the general one, and deliberately
+    # higher. Every newly discovered pool fires this detector exactly once,
+    # so it is the single largest source of notifications: at $1,000 it
+    # produced 66 of one day's 76 alerts. The other detectors fire only when
+    # something changes, which is self-limiting; this one does not.
+    event_new_token_min_liquidity_usd: float = 25_000.0
     event_min_volume_usd: float = 10_000.0
     event_volume_spike_pct: float = 150.0
     event_liquidity_drain_pct: float = 30.0
@@ -316,7 +355,21 @@ def load_settings(env_path: Path | str | None = None, *, override: bool = False)
         snapshot_raw_mode=(
             _get_str("SNAPSHOT_RAW_MODE", "events_only") or "events_only"
         ).lower(),
+        notify_digest_only_categories=_get_csv(
+            "NOTIFY_DIGEST_ONLY_CATEGORIES", ("new_coin",)),
+        watchlist_min_liquidity_usd=_get_float(
+            "WATCHLIST_MIN_LIQUIDITY_USD", 10_000.0),
+        watchlist_readd_cooldown_hours=_get_int(
+            "WATCHLIST_READD_COOLDOWN_HOURS", 168),
+        watchlist_retire_enabled=_get_bool("WATCHLIST_RETIRE_ENABLED", True),
+        watchlist_retire_below_liquidity_usd=_get_float(
+            "WATCHLIST_RETIRE_BELOW_LIQUIDITY_USD", 2_000.0),
+        watchlist_retire_grace_hours=_get_int("WATCHLIST_RETIRE_GRACE_HOURS", 6),
+        watchlist_retire_uneventful_hours=_get_int(
+            "WATCHLIST_RETIRE_UNEVENTFUL_HOURS", 72),
         event_min_liquidity_usd=_get_float("EVENT_MIN_LIQUIDITY_USD", 5_000.0),
+        event_new_token_min_liquidity_usd=_get_float(
+            "EVENT_NEW_TOKEN_MIN_LIQUIDITY_USD", 25_000.0),
         event_min_volume_usd=_get_float("EVENT_MIN_VOLUME_USD", 10_000.0),
         event_volume_spike_pct=_get_float("EVENT_VOLUME_SPIKE_PCT", 150.0),
         event_liquidity_drain_pct=_get_float("EVENT_LIQUIDITY_DRAIN_PCT", 30.0),
@@ -408,6 +461,22 @@ def validate_settings(settings: Settings, stages: tuple[str, ...] = ("database",
         problems.append(
             "SNAPSHOT_HEARTBEAT_SECONDS below 60 would write a snapshot almost "
             "every pass, which fills the database quickly."
+        )
+
+    if settings.event_new_token_min_liquidity_usd <= 0:
+        problems.append(
+            f"EVENT_NEW_TOKEN_MIN_LIQUIDITY_USD is "
+            f"{settings.event_new_token_min_liquidity_usd}; expected a "
+            f"positive number. Set it to the smallest pool you want to hear "
+            f"about at all."
+        )
+
+    if settings.watchlist_retire_grace_hours < 1:
+        problems.append(
+            f"WATCHLIST_RETIRE_GRACE_HOURS is "
+            f"{settings.watchlist_retire_grace_hours}; expected at least 1. "
+            f"A brand-new pool is still filling, so retiring it immediately "
+            f"would drop the tokens most worth watching."
         )
 
     if settings.event_min_liquidity_usd <= 0:

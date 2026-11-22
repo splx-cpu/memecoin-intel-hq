@@ -138,9 +138,26 @@ select w.id,
 
 # The partial unique index is `on watchlists (token_id) where is_active`, so
 # the conflict target must repeat that predicate for Postgres to match it.
+# The `where not exists` is a COOLDOWN, and it is what stops a loop.
+#
+# Discovery now adds any token that meets the liquidity floor, not only ones
+# it has never seen - otherwise a pool that launches small and grows could
+# never be picked up, because `was_inserted` is true exactly once. But that
+# also means a token retired for being uneventful, while still well funded,
+# would be re-added on the very next pass and bounce between states forever.
+#
+# `on conflict do nothing` cannot prevent that: the retired row is inactive,
+# so the partial unique index does not see a conflict at all.
 SQL_ADD_TO_WATCHLIST = """
 insert into watchlists (token_id, category, added_reason, priority)
-values (%s, %s, %s, %s)
+select %s, %s, %s, %s
+ where not exists (
+     select 1
+       from watchlists w
+      where w.token_id = %s
+        and w.removed_at is not null
+        and w.removed_at > now() - make_interval(hours => %s)
+ )
 on conflict (token_id) where is_active do nothing
 returning id
 """
@@ -285,13 +302,42 @@ select count(*) from notification_logs
  where status = 'failed' and created_at >= %s
 """
 
+# The category exclusion is NOT an optimisation - it is what keeps the queue
+# usable. Ordering is oldest-first, so without it ~500 new-token events a day
+# would sit in front of every risk alert, and a liquidity drain would wait
+# days behind a backlog of "a new pool exists". Excluded categories never
+# enter the queue at all; SQL_RESOLVE_DIGEST_ONLY clears them separately.
+#
+# An empty exclusion list is handled by `<> all(...)`, which is true for
+# every row against an empty array - so clearing the setting restores the
+# old behaviour with no special case.
 SQL_PENDING_NOTIFICATION = """
 select id, token_id, chain, category, event_type, severity, triggered_at,
        payload, research_report_id
   from alert_events
  where not is_notified and not is_suppressed
+   and category <> all(%s)
  order by triggered_at asc
  limit %s
+"""
+
+# Marks digest-only events as handled in one statement rather than one round
+# trip each. Two reasons this matters beyond speed:
+#
+# 1. Left pending forever, the queue grows without limit.
+# 2. If the user later removes a category from the exclusion list, every
+#    back-dated event would suddenly become sendable and arrive at once.
+#    Resolving them as they occur means re-enabling affects only new events.
+#
+# `is_suppressed` is deliberately NOT set: the daily summary excludes
+# suppressed events, and these must still be counted there. Being quiet
+# about something is not the same as pretending it did not happen.
+SQL_RESOLVE_DIGEST_ONLY = """
+update alert_events
+   set is_notified = true
+ where not is_notified
+   and not is_suppressed
+   and category = any(%s)
 """
 
 # Events are inserted BEFORE the snapshot (so deduplication decides whether
@@ -386,6 +432,91 @@ select flag_type, severity, detail, evidence, detected_at
      when 'low' then 3 else 4 end
 """
 
+
+# ---------------------------------------------------------------------------
+# watchlist retirement
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+#
+# Discovery adds; nothing removed. The list reached 283 entries in two days,
+# and every entry costs an API call and a row on every pass, against a 500 MB
+# free tier. Growth without a counterweight ends in one of two ways: the
+# quota runs out, or the scanner slows until it is useless.
+#
+# WHY RETIREMENT IS SAFE
+#
+# `is_active = false` with `removed_at` set keeps the whole history, and the
+# partial unique index (active rows only) means discovery can re-add the same
+# token later if it comes back to life. Nothing is deleted.
+
+# Rule 1: the money left.
+#
+# The NULL handling here is the important part, and it is deliberate. The
+# subquery returns NULL when a token has no snapshots at all, and also when
+# the latest snapshot has no liquidity figure. `NULL < 2000` is NULL, not
+# true, so neither case retires the row.
+#
+# That is the behaviour we want: liquidity DISAPPEARING from the provider
+# feed is the single most important signal this system has - it may be the
+# pool being pulled - and it already raises `liquidity_unreported`. Retiring
+# a token at exactly the moment it becomes interesting would be the worst
+# possible bug, and "unknown is not low" is what prevents it.
+SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST = """
+update watchlists w
+   set is_active = false,
+       removed_at = now(),
+       notes = coalesce(w.notes || ' | ', '') || %s
+ where w.is_active
+   and w.added_at < now() - make_interval(hours => %s)
+   and (
+       select s.liquidity_usd
+         from market_snapshots s
+        where s.token_id = w.token_id
+        order by s.captured_at desc
+        limit 1
+   ) < %s
+returning w.id, w.token_id
+"""
+
+# Rule 2: it has been watched for days and has never done anything.
+#
+# The arrival event is excluded from the "did anything happen" test because
+# every token on the list fired it once on arrival - counting it would mean no
+# row ever qualifies, and the rule would silently do nothing. It is passed in
+# rather than written here: the first version hardcoded 'new_token', which is
+# the detector's CLASS name, while the event it writes is 'first_seen'. The
+# rule matched nothing and failed silently, which is exactly what a rule like
+# this does when it is wrong.
+SQL_RETIRE_UNEVENTFUL_WATCHLIST = """
+update watchlists w
+   set is_active = false,
+       removed_at = now(),
+       notes = coalesce(w.notes || ' | ', '') || %s
+ where w.is_active
+   and w.added_at < now() - make_interval(hours => %s)
+   and not exists (
+       select 1
+         from alert_events e
+        where e.token_id = w.token_id
+          and e.event_type <> %s
+   )
+returning w.id, w.token_id
+"""
+
+# Reported by the tuning script so a threshold can be chosen from real data
+# rather than guessed. Reads liquidity from the event's own payload rather
+# than joining to market_snapshots: `snapshot_id` is null whenever the write
+# policy skipped the snapshot, and a join through it silently drops those
+# rows - which is how the first version of this query returned nothing at all
+# against a database holding 66 of these events.
+SQL_NEW_TOKEN_LIQUIDITY_SAMPLE = """
+select (e.payload->>'liquidity_usd')::numeric
+  from alert_events e
+ where e.event_type = %s
+   and e.triggered_at >= %s
+   and e.payload->>'liquidity_usd' is not null
+"""
 
 # ---------------------------------------------------------------------------
 # daily summaries
@@ -670,11 +801,20 @@ class Repository:
         return [WatchlistEntry.from_row(r) for r in rows]
 
     def add_to_watchlist(
-        self, token_id: int, *, category: str, reason: str | None = None, priority: int = 100
+        self, token_id: int, *, category: str, reason: str | None = None,
+        priority: int = 100, readd_cooldown_hours: int = 0,
     ) -> int | None:
-        """Returns the new row id, or None if the token was already watched."""
+        """Returns the new row id, or None.
+
+        None means one of two things, deliberately not distinguished here:
+        the token is already watched, or it was retired recently enough to
+        still be in its cooldown. Both mean "do not add", and the caller has
+        nothing different to do about either.
+        """
         with self.conn.cursor() as cur:
-            cur.execute(SQL_ADD_TO_WATCHLIST, (token_id, category, reason, priority))
+            cur.execute(SQL_ADD_TO_WATCHLIST,
+                        (token_id, category, reason, priority,
+                         token_id, readd_cooldown_hours))
             row = cur.fetchone()
         return row[0] if row else None
 
@@ -842,10 +982,20 @@ class Repository:
             cur.execute(SQL_PENDING_ANALYSIS, (limit,))
             return list(cur.fetchall())
 
-    def pending_notification(self, limit: int = 20) -> list[tuple[Any, ...]]:
+    def pending_notification(
+        self, limit: int = 20, *, exclude_categories: tuple[str, ...] = ()
+    ) -> list[tuple[Any, ...]]:
         with self.conn.cursor() as cur:
-            cur.execute(SQL_PENDING_NOTIFICATION, (limit,))
+            cur.execute(SQL_PENDING_NOTIFICATION, (list(exclude_categories), limit))
             return list(cur.fetchall())
+
+    def resolve_digest_only(self, categories: tuple[str, ...]) -> int:
+        """Mark digest-only events handled. Returns how many."""
+        if not categories:
+            return 0
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_RESOLVE_DIGEST_ONLY, (list(categories),))
+            return cur.rowcount or 0
 
     # -- risk flags ------------------------------------------------------
 
@@ -925,6 +1075,41 @@ class Repository:
         with self.conn.cursor() as cur:
             cur.execute(SQL_STALE_RUNNING, (older_than_seconds,))
             return list(cur.fetchall())
+
+    def retire_low_liquidity(
+        self, *, below_usd: float, grace_hours: int, note: str
+    ) -> list[tuple[int, int]]:
+        """Retire entries whose latest snapshot shows the money has gone.
+
+        Tokens with unknown liquidity are deliberately left alone - see the
+        note on SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST,
+                        (note, grace_hours, below_usd))
+            return list(cur.fetchall())
+
+    def retire_uneventful(
+        self, *, older_than_hours: int, note: str, arrival_event_type: str
+    ) -> list[tuple[int, int]]:
+        """Retire long-lived entries that never produced a real event.
+
+        `arrival_event_type` is the one that does NOT count as activity. It
+        is passed in from the detector that writes it so the two cannot
+        drift apart.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_RETIRE_UNEVENTFUL_WATCHLIST,
+                        (note, older_than_hours, arrival_event_type))
+            return list(cur.fetchall())
+
+    def new_token_liquidity_sample(
+        self, since: datetime, *, arrival_event_type: str
+    ) -> list[float]:
+        """Liquidity of recently discovered tokens, for choosing a floor."""
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_NEW_TOKEN_LIQUIDITY_SAMPLE, (arrival_event_type, since))
+            return [float(r[0]) for r in cur.fetchall() if r[0] is not None]
 
     # -- daily summaries -------------------------------------------------
 
@@ -1038,6 +1223,7 @@ ALL_STATEMENTS: dict[str, str] = {
     "SQL_COUNT_REPORTS_SINCE": SQL_COUNT_REPORTS_SINCE,
     "SQL_PENDING_ANALYSIS": SQL_PENDING_ANALYSIS,
     "SQL_PENDING_NOTIFICATION": SQL_PENDING_NOTIFICATION,
+    "SQL_RESOLVE_DIGEST_ONLY": SQL_RESOLVE_DIGEST_ONLY,
     "SQL_EVENT_WITH_CONTEXT": SQL_EVENT_WITH_CONTEXT,
     "SQL_INSERT_NOTIFICATION_LOG": SQL_INSERT_NOTIFICATION_LOG,
     "SQL_NOTIFICATION_FAILURES_SINCE": SQL_NOTIFICATION_FAILURES_SINCE,
@@ -1048,6 +1234,9 @@ ALL_STATEMENTS: dict[str, str] = {
     "SQL_UPSERT_RISK_FLAG": SQL_UPSERT_RISK_FLAG,
     "SQL_RESOLVE_ABSENT_RISK_FLAGS": SQL_RESOLVE_ABSENT_RISK_FLAGS,
     "SQL_ACTIVE_RISK_FLAGS": SQL_ACTIVE_RISK_FLAGS,
+    "SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST": SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST,
+    "SQL_RETIRE_UNEVENTFUL_WATCHLIST": SQL_RETIRE_UNEVENTFUL_WATCHLIST,
+    "SQL_NEW_TOKEN_LIQUIDITY_SAMPLE": SQL_NEW_TOKEN_LIQUIDITY_SAMPLE,
     "SQL_SUMMARY_RUN_TOTALS": SQL_SUMMARY_RUN_TOTALS,
     "SQL_SUMMARY_ALERTS": SQL_SUMMARY_ALERTS,
     "SQL_SUMMARY_HIGHLIGHTS": SQL_SUMMARY_HIGHLIGHTS,

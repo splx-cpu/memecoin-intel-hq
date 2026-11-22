@@ -129,6 +129,14 @@ def _base_payload(
 # Detectors
 # ---------------------------------------------------------------------------
 
+# The event type the arrival detector writes. Named here, once, because
+# other modules need to EXCLUDE it: every watched token has one, so counting
+# it as activity makes "this token has never done anything" always false.
+# It is deliberately not the same string as the detector's `name`, and that
+# discrepancy already caused one silent bug.
+FIRST_SEEN_EVENT_TYPE = "first_seen"
+
+
 class NewTokenDetector:
     """Fires once, the first time we ever see a token.
 
@@ -159,11 +167,12 @@ class NewTokenDetector:
 
         return DetectedEvent(
             category="new_coin",
-            event_type="first_seen",
+            event_type=FIRST_SEEN_EVENT_TYPE,
             severity="info",
             event_key=build_event_key(
                 category="new_coin", chain=current.token.chain,
-                token_address=current.token.address, event_type="first_seen",
+                token_address=current.token.address,
+                event_type=FIRST_SEEN_EVENT_TYPE,
                 bucket_minutes=None,
             ),
             headline=(
@@ -436,7 +445,12 @@ class ChurnRatioDetector:
 def default_detectors(settings: Settings) -> list[Detector]:
     """The standard set, configured from .env."""
     return [
-        NewTokenDetector(min_liquidity=settings.event_min_liquidity_usd / 5),
+        # Its own setting, not a fraction of the general floor. Deriving it
+        # meant that raising the general threshold to quiet the change
+        # detectors ALSO raised this one, and lowering it to catch smaller
+        # moves flooded the phone with new pools - two unrelated decisions
+        # tied to one number.
+        NewTokenDetector(min_liquidity=settings.event_new_token_min_liquidity_usd),
         LiquidityDrainDetector(
             threshold_pct=settings.event_liquidity_drain_pct,
             min_liquidity_before=settings.event_min_liquidity_usd,
