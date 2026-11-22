@@ -100,7 +100,53 @@ class Worker:
                 results["notifications"] = notifier.dispatch_pending(
                     limit=self.settings.notify_batch_size
                 )
+
+            # Health checks run LAST and inside the same connection, so they
+            # see the pass that just finished rather than the state before it.
+            #
+            # They are also the reason `send_system_alert` finally has a
+            # caller - it was written in Stage F and left unconnected, which
+            # made the code read as though failures were reported when
+            # nothing ever reported one.
+            if notify or which == "notify":
+                results["health"] = self._check_health(
+                    conn, notifier, results)
         return results
+
+    def _check_health(self, conn: Any, notifier: Any,
+                      results: dict[str, Any]) -> Any:
+        """Never raises. A broken health check must not break the scan."""
+        from mihq.health import HealthReport, check_run_outcome, run_health_checks
+
+        try:
+            repo = Repository(conn)
+            report = run_health_checks(repo, notifier, self.settings)
+
+            # Problems with the pass that just ran, which the database-level
+            # checks cannot see: the run row says 'failed', but staleness
+            # only notices once the gap grows.
+            immediate = []
+            for name in ("discovery", "watchlist"):
+                outcome = results.get(name)
+                if outcome is None:
+                    continue
+                immediate += check_run_outcome(
+                    name,
+                    getattr(outcome, "status", "success"),
+                    getattr(outcome, "provider_errors", 0),
+                )
+            if immediate:
+                from mihq.health import report_problems
+                extra = report_problems(immediate, repo, notifier, self.settings)
+                report.problems += extra.problems
+                report.sent += extra.sent
+                report.throttled += extra.throttled
+                report.errors += extra.errors
+            return report
+        except Exception as exc:  # noqa: BLE001
+            log.warning("health checks failed", extra={"error": str(exc)})
+            from mihq.health import HealthReport as _HR
+            return _HR(errors=[str(exc)])
 
     def run_daily_summary(
         self, *, for_date: Any = None, force: bool = False
@@ -190,6 +236,48 @@ class Worker:
         log.info("worker stopped")
 
 
+
+def notify_fatal(settings: Any, exc: BaseException) -> str:
+    """Tell the user over Telegram that the run died.
+
+    Returns the send status - "sent", "skipped" (DRY_RUN or no token),
+    "failed", or "error". Not a bool: "we deliberately did not send" and "we
+    tried and could not" are different facts, and this is the one message
+    whose job is to say truthfully whether the user was actually told.
+
+    WHY THIS EXISTS SEPARATELY FROM THE HEALTH MONITOR
+
+    Every check in `mihq.health` needs a database connection. When the
+    database is the thing that is broken, none of them run - the process
+    crashes inside `connect()` before any of them is reached, and the only
+    trace is a failed GitHub workflow and whatever email GitHub chooses to
+    send.
+
+    Telegram does not need the database. So this path deliberately builds a
+    bare client with no repository at all: it cannot log the attempt, and
+    that is the point - it is the one report that still works when storage
+    is gone.
+
+    It never raises. A failure to report a crash must not replace the crash
+    with a different one.
+    """
+    from mihq.db.connection import redact_dsn
+    from mihq.notify.formatters import format_system_alert
+    from mihq.notify.telegram import TelegramClient
+
+    try:
+        # The exception text can carry the connection string, password and
+        # all, because psycopg puts the DSN in its errors.
+        detail = redact_dsn(f"{type(exc).__name__}: {exc}")[:600]
+        message = format_system_alert(
+            "Scanner run crashed",
+            f"The run stopped before it finished.\n\n{detail}",
+            severity="critical",
+        )
+        return TelegramClient(settings).send_message(message).status
+    except Exception:  # noqa: BLE001
+        return "error"
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the MemeCoin Intelligence HQ scanners.")
     parser.add_argument("--once", action="store_true", help="Run one pass of each, then exit.")
@@ -248,7 +336,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.discovery or args.watchlist or args.once:
         which = "discovery" if args.discovery else "watchlist" if args.watchlist else "both"
-        results = worker.run_once(which=which, notify=not args.no_notify)
+        try:
+            results = worker.run_once(which=which, notify=not args.no_notify)
+        except Exception as exc:  # noqa: BLE001 - a crash the health checks
+                                  # cannot report, because they need the
+                                  # database that just failed
+            log.error("run failed", extra={"error": f"{type(exc).__name__}: {exc}"})
+            status = notify_fatal(settings, exc)
+            explain = {
+                "sent": "Telegram alert sent.",
+                "skipped": "Telegram alert NOT sent (dry run, or no bot token).",
+                "failed": "Telegram alert could NOT be delivered.",
+                "error": "Telegram alert could not even be attempted.",
+            }.get(status, f"Telegram alert status: {status}.")
+            print(f"\nRun failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(explain, file=sys.stderr)
+            return 1
         for result in results.values():
             print(result.summary())
         return 0

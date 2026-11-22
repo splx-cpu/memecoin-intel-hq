@@ -216,6 +216,22 @@ class Settings:
     # --- Watchlist retirement (see mihq.scanners.retire) ----------------
     # Without these the watchlist only ever grows, and every entry costs API
     # calls and database rows on every pass, forever.
+    # --- Health monitoring (see mihq.health) ----------------------------
+    health_checks_enabled: bool = True
+    # How long a scanner may go without a SUCCESSFUL pass before that counts
+    # as a problem. Generous on purpose: GitHub's scheduled runs on a free
+    # public repo arrive roughly hourly rather than on the cron written in
+    # the workflow, so a tight threshold would cry wolf constantly.
+    health_discovery_stale_hours: int = 6
+    health_watchlist_stale_hours: int = 6
+    # Supabase free tier is 500 MB.
+    health_storage_limit_mb: int = 500
+    health_storage_warn_pct: float = 70.0
+    # A run still marked 'running' this long after it started was killed.
+    health_abandoned_run_minutes: int = 60
+    # Do not repeat the same KIND of system alert more often than this.
+    health_alert_cooldown_hours: int = 12
+
     # What is worth watching in the first place. Until now the only gate was
     # "have we seen this token before", so EVERY discovered pool joined the
     # watchlist at any size - which is how it reached 2,367 entries in two
@@ -357,6 +373,13 @@ def load_settings(env_path: Path | str | None = None, *, override: bool = False)
         ).lower(),
         notify_digest_only_categories=_get_csv(
             "NOTIFY_DIGEST_ONLY_CATEGORIES", ("new_coin",)),
+        health_checks_enabled=_get_bool("HEALTH_CHECKS_ENABLED", True),
+        health_discovery_stale_hours=_get_int("HEALTH_DISCOVERY_STALE_HOURS", 6),
+        health_watchlist_stale_hours=_get_int("HEALTH_WATCHLIST_STALE_HOURS", 6),
+        health_storage_limit_mb=_get_int("HEALTH_STORAGE_LIMIT_MB", 500),
+        health_storage_warn_pct=_get_float("HEALTH_STORAGE_WARN_PCT", 70.0),
+        health_abandoned_run_minutes=_get_int("HEALTH_ABANDONED_RUN_MINUTES", 60),
+        health_alert_cooldown_hours=_get_int("HEALTH_ALERT_COOLDOWN_HOURS", 12),
         watchlist_min_liquidity_usd=_get_float(
             "WATCHLIST_MIN_LIQUIDITY_USD", 10_000.0),
         watchlist_readd_cooldown_hours=_get_int(

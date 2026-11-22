@@ -1,0 +1,74 @@
+# Stops GitHub switching the whole system off.
+#
+# THE FAILURE THIS PREVENTS
+#
+# GitHub suspends scheduled triggers on a PUBLIC repository after 60 days
+# with no repository activity. The workflows do not fail - they simply stop
+# being triggered. No error, no email at the time, no failed run to notice.
+# The scanner just goes quiet, and every other health check in this project
+# goes quiet with it, because none of them execute either.
+#
+# That makes it the single most dangerous failure mode here: the system is
+# designed so that silence means "nothing happened", and this is the one case
+# where silence means "everything stopped".
+#
+# WHY A COMMIT RATHER THAN A WORKFLOW RUN
+#
+# Scheduled runs of the scanner do NOT reset the inactivity timer - that is
+# the whole point of the suspension, and why repositories with hourly cron
+# jobs still get switched off. It takes repository activity. So this writes a
+# timestamp to a file and commits it.
+#
+# WEEKLY, NOT DAILY
+#
+# The deadline is 60 days. Weekly leaves eight chances to succeed before it
+# matters, and keeps the commit history to about 52 lines a year instead of
+# 365. Sunday 05:00 UTC is deliberately away from the other workflows.
+
+name: Keepalive
+
+on:
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record a heartbeat and commit it
+        run: |
+          set -euo pipefail
+          mkdir -p .github
+          {
+            echo "# Keepalive"
+            echo
+            echo "GitHub suspends scheduled workflows on public repositories"
+            echo "after 60 days without repository activity. This file is"
+            echo "committed weekly to reset that timer. It has no other"
+            echo "purpose and nothing reads it."
+            echo
+            echo "Last heartbeat: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } > .github/KEEPALIVE.md
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/KEEPALIVE.md
+
+          # --allow-empty is deliberately NOT used. If the content somehow
+          # did not change, an empty commit would still satisfy GitHub but
+          # would hide the fact that the date stamp had stopped updating.
+          if git diff --staged --quiet; then
+            echo "Nothing changed - the timestamp did not update. Not committing."
+            exit 1
+          fi
+
+          git commit -m "chore: keepalive heartbeat [skip ci]"
+          git push

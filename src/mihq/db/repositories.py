@@ -434,6 +434,33 @@ select flag_type, severity, detail, evidence, detected_at
 
 
 # ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+
+# Supabase's free tier is 500 MB. Nothing in the system could see how close it
+# was to that, and the failure mode when it fills is writes starting to fail -
+# which looks like a scanner bug rather than a quota.
+SQL_DATABASE_SIZE = """
+select pg_database_size(current_database())
+"""
+
+# Throttles repeated system alerts. The key identifies the KIND of problem, so
+# a database that has been unreachable for six hours reports once rather than
+# once per run.
+#
+# Deliberately keyed on request_payload->>'key' rather than on the message
+# text: the text contains elapsed times and sizes that change every run, so
+# matching on it would never throttle anything.
+SQL_LAST_SYSTEM_ALERT = """
+select max(created_at)
+  from notification_logs
+ where message_type = 'system'
+   and status in ('sent', 'skipped')
+   and request_payload->>'key' = %s
+"""
+
+
+# ---------------------------------------------------------------------------
 # watchlist retirement
 # ---------------------------------------------------------------------------
 #
@@ -1111,6 +1138,20 @@ class Repository:
             cur.execute(SQL_NEW_TOKEN_LIQUIDITY_SAMPLE, (arrival_event_type, since))
             return [float(r[0]) for r in cur.fetchall() if r[0] is not None]
 
+    # -- health ----------------------------------------------------------
+
+    def database_size_bytes(self) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_DATABASE_SIZE)
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def last_system_alert(self, key: str) -> datetime | None:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_LAST_SYSTEM_ALERT, (key,))
+            row = cur.fetchone()
+        return row[0] if row else None
+
     # -- daily summaries -------------------------------------------------
 
     def summary_run_totals(
@@ -1234,6 +1275,8 @@ ALL_STATEMENTS: dict[str, str] = {
     "SQL_UPSERT_RISK_FLAG": SQL_UPSERT_RISK_FLAG,
     "SQL_RESOLVE_ABSENT_RISK_FLAGS": SQL_RESOLVE_ABSENT_RISK_FLAGS,
     "SQL_ACTIVE_RISK_FLAGS": SQL_ACTIVE_RISK_FLAGS,
+    "SQL_DATABASE_SIZE": SQL_DATABASE_SIZE,
+    "SQL_LAST_SYSTEM_ALERT": SQL_LAST_SYSTEM_ALERT,
     "SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST": SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST,
     "SQL_RETIRE_UNEVENTFUL_WATCHLIST": SQL_RETIRE_UNEVENTFUL_WATCHLIST,
     "SQL_NEW_TOKEN_LIQUIDITY_SAMPLE": SQL_NEW_TOKEN_LIQUIDITY_SAMPLE,

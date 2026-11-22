@@ -303,8 +303,17 @@ class NotificationDispatcher:
                     report.lp_locked_percent = r[3].get("lp_locked_percent")
         return report
 
-    def send_system_alert(self, title: str, detail: str, *, severity: str = "high") -> bool:
-        """Health notice to the admin chat. Returns True if it went out."""
+    def send_system_alert(
+        self, title: str, detail: str, *, severity: str = "high",
+        key: str | None = None,
+    ) -> bool:
+        """Health notice to the admin chat. Returns True if it went out.
+
+        `key` identifies the KIND of problem and is recorded in the log row,
+        which is what SQL_LAST_SYSTEM_ALERT reads to throttle repeats. Without
+        it every alert looks new, because the message text carries elapsed
+        times and sizes that differ every run.
+        """
         message = format_system_alert(title, detail, severity=severity)
         send = self.client.send_admin(message)
         try:
@@ -313,7 +322,9 @@ class NotificationDispatcher:
                 attempt=send.attempt, chat_id=send.chat_id,
                 telegram_message_id=send.telegram_message_id,
                 error_code=send.error_code, error_message=send.error_message,
+                request_payload={"key": key} if key else None,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - failing to RECORD an alert must
+                           # never stop it being SENT
             pass
         return send.was_sent
