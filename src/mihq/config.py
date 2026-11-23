@@ -191,7 +191,13 @@ class Settings:
     )
     discovery_interval_seconds: int = 300
     watchlist_interval_seconds: int = 60
-    watchlist_batch_size: int = 40
+    # Raised from 40. At 40 per pass on an hourly schedule, 1,859 entries
+    # took 46 hours to cycle - so most of the list was never current, and
+    # anything depending on a recent reading was working from stale data.
+    #
+    # 200 is still nothing against the provider limits: pool lookups batch 30
+    # to a request, so a full pass is about 7 calls against a 240/min budget.
+    watchlist_batch_size: int = 200
 
     # --- Snapshot write policy (see mihq.scanners.policy) ---------------
     snapshot_price_change_pct: float = 2.0
@@ -265,6 +271,10 @@ class Settings:
     # token; short enough that the ordinary dead-token end state clears. The
     # `liquidity_unreported` alert has already fired well before this.
     watchlist_retire_unknown_after_hours: int = 24
+    # A token is only retired for unreadable liquidity if we have actually
+    # scanned it this recently. Otherwise the rule punishes tokens the
+    # scanner has not reached, which is a fact about us, not about them.
+    watchlist_retire_requires_scan_within_hours: int = 12
     watchlist_retire_uneventful_hours: int = 72
 
     # --- Event detection thresholds (see mihq.events.detectors) ---------
@@ -381,7 +391,7 @@ def load_settings(env_path: Path | str | None = None, *, override: bool = False)
         ),
         discovery_interval_seconds=_get_int("DISCOVERY_INTERVAL_SECONDS", 300),
         watchlist_interval_seconds=_get_int("WATCHLIST_INTERVAL_SECONDS", 60),
-        watchlist_batch_size=_get_int("WATCHLIST_BATCH_SIZE", 40),
+        watchlist_batch_size=_get_int("WATCHLIST_BATCH_SIZE", 200),
         snapshot_price_change_pct=_get_float("SNAPSHOT_PRICE_CHANGE_PCT", 2.0),
         snapshot_liquidity_change_pct=_get_float("SNAPSHOT_LIQUIDITY_CHANGE_PCT", 5.0),
         snapshot_volume_change_pct=_get_float("SNAPSHOT_VOLUME_CHANGE_PCT", 10.0),
@@ -408,6 +418,8 @@ def load_settings(env_path: Path | str | None = None, *, override: bool = False)
         watchlist_retire_grace_hours=_get_int("WATCHLIST_RETIRE_GRACE_HOURS", 6),
         watchlist_retire_unknown_after_hours=_get_int(
             "WATCHLIST_RETIRE_UNKNOWN_AFTER_HOURS", 24),
+        watchlist_retire_requires_scan_within_hours=_get_int(
+            "WATCHLIST_RETIRE_REQUIRES_SCAN_WITHIN_HOURS", 12),
         watchlist_retire_uneventful_hours=_get_int(
             "WATCHLIST_RETIRE_UNEVENTFUL_HOURS", 72),
         event_min_liquidity_usd=_get_float("EVENT_MIN_LIQUIDITY_USD", 5_000.0),

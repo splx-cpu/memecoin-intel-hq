@@ -94,6 +94,8 @@ def retire_quiet_entries(settings: Settings, repo: Repository) -> RetirementResu
         rows = repo.retire_unknown_liquidity(
             grace_hours=settings.watchlist_retire_grace_hours,
             unknown_for_hours=settings.watchlist_retire_unknown_after_hours,
+            scanned_within_hours=(
+                settings.watchlist_retire_requires_scan_within_hours),
             note=note,
         )
         result.unknown_liquidity = len(rows)

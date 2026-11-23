@@ -460,7 +460,7 @@ class TestUnknownLiquidityRule:
         sql = SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
         assert "max(s.captured_at)" in sql
         assert "s.liquidity_usd is not null" in sql
-        assert sql.count("make_interval(hours =>") == 2   # grace AND window
+        assert sql.count("make_interval(hours =>") == 3   # grace, window, scan guard
 
     def test_a_token_that_never_had_a_figure_falls_back_to_when_it_was_added(self):
         """Without the COALESCE the subquery returns NULL, the comparison is
@@ -477,6 +477,37 @@ class TestUnknownLiquidityRule:
             settings(watchlist_retire_unknown_after_hours=36), repo)
         assert dict(repo.calls[1][1])["unknown_for_hours"] == 36
 
+    def test_a_token_we_have_not_scanned_is_never_retired_by_this_rule(self):
+        """THE BUG THIS GUARD EXISTS FOR.
+
+        "No reading for 24 hours" and "we have not looked for 24 hours" are
+        indistinguishable in the snapshot table, and only the first is a fact
+        about the token. With a batch size of 40 on an hourly schedule and
+        1,859 active entries, a full cycle took 46 hours - so most of the
+        list was permanently outside the window through no fault of its own,
+        and the watchlist collapsed in a way that looked like success.
+
+        A token we have not managed to scan is one we have no opinion about.
+        """
+        from mihq.db.repositories import SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+
+        sql = SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+        assert "w.last_scanned_at is not null" in sql
+        assert "w.last_scanned_at > now() - make_interval(hours =>" in sql
+
+    def test_the_scan_guard_is_passed_through(self):
+        repo = FakeRepo()
+        retire_quiet_entries(
+            settings(watchlist_retire_requires_scan_within_hours=8), repo)
+        assert dict(repo.calls[1][1])["scanned_within_hours"] == 8
+
+    def test_the_scan_guard_is_shorter_than_the_unknown_window(self):
+        """Otherwise it cannot bind: the guard has to prove we looked DURING
+        the period we are judging the token on."""
+        s = settings()
+        assert (s.watchlist_retire_requires_scan_within_hours
+                < s.watchlist_retire_unknown_after_hours)
+
     def test_the_note_says_why(self):
         repo = FakeRepo()
         retire_quiet_entries(
@@ -490,3 +521,25 @@ class TestUnknownLiquidityRule:
         assert "delete" not in sql.lower()
         assert "is_active = false" in sql
         assert "removed_at = now()" in sql
+
+
+class TestScannerKeepsUp:
+    """A batch size that cannot cycle the list inside the retirement window
+    makes every freshness-based rule unsound, because 'stale' stops meaning
+    'the token went quiet' and starts meaning 'we were too slow'."""
+
+    def test_a_full_cycle_fits_inside_the_unknown_window(self):
+        s = settings()
+        # GitHub's scheduled runs arrive roughly hourly, not on the cron.
+        passes_per_day = 24
+        capacity = s.watchlist_batch_size * passes_per_day
+        assert capacity >= 2_000, (
+            f"at {s.watchlist_batch_size}/pass the scanner covers only "
+            f"{capacity} tokens a day, so a watchlist larger than that can "
+            f"never be current")
+
+    def test_a_pass_stays_well_inside_the_provider_rate_limit(self):
+        """Pool lookups batch 30 to a request."""
+        s = settings()
+        requests_per_pass = -(-s.watchlist_batch_size // 30)
+        assert requests_per_pass <= s.dexscreener_rate_limit_per_min / 4

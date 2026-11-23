@@ -591,6 +591,20 @@ update watchlists w
              and s.liquidity_usd is not null),
          w.added_at
        ) < now() - make_interval(hours => %s)
+   -- WE MUST HAVE ACTUALLY LOOKED.
+   --
+   -- Without this the rule retires tokens for not being SCANNED rather than
+   -- for being dead, and the two are indistinguishable from the snapshot
+   -- table alone: both leave no recent reading.
+   --
+   -- It is not hypothetical. With a batch size of 40, an hourly schedule and
+   -- 1,859 active entries, a full cycle took 46 hours - so most of the list
+   -- was always outside a 24-hour window through no fault of its own. The
+   -- watchlist duly collapsed, which looked like the fix working.
+   --
+   -- A token we have not managed to scan is one we have no opinion about.
+   and w.last_scanned_at is not null
+   and w.last_scanned_at > now() - make_interval(hours => %s)
 returning w.id, w.token_id
 """
 
@@ -1206,12 +1220,18 @@ class Repository:
             return list(cur.fetchall())
 
     def retire_unknown_liquidity(
-        self, *, grace_hours: int, unknown_for_hours: int, note: str
+        self, *, grace_hours: int, unknown_for_hours: int,
+        scanned_within_hours: int, note: str
     ) -> list[tuple[int, int]]:
-        """Retire entries with no readable liquidity for a long time."""
+        """Retire entries we HAVE scanned recently that still show no liquidity.
+
+        `scanned_within_hours` is the guard against retiring a token merely
+        because the scanner has not reached it yet.
+        """
         with self.conn.cursor() as cur:
             cur.execute(SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST,
-                        (note, grace_hours, unknown_for_hours))
+                        (note, grace_hours, unknown_for_hours,
+                         scanned_within_hours))
             return list(cur.fetchall())
 
     def retire_uneventful(
