@@ -555,6 +555,46 @@ update watchlists w
 returning w.id, w.token_id
 """
 
+# Rule 3: liquidity has been unknown for a long time.
+#
+# THIS RULE EXISTS BECAUSE RULE 1'S PROTECTION WAS TOO BROAD.
+#
+# Rule 1 deliberately never retires a token whose liquidity is unknown,
+# because liquidity vanishing from the feed may be a pool being pulled - the
+# moment you most want to still be watching. That reasoning is right about
+# the FIRST FEW HOURS and wrong after that.
+#
+# Measured on real data: 990 of 1,859 active entries (53%) had unknown
+# liquidity. It is not a rare emergency, it is the ordinary end state of a
+# dead token - it drops out of the provider feed and never returns. Rule 1
+# was therefore pinning half the watchlist in place permanently, and no
+# amount of adjusting the other thresholds would have fixed it.
+#
+# `liquidity_unreported` has already alerted by then. Watching a token whose
+# liquidity has been unreadable for a day buys nothing.
+#
+# The COALESCE matters: a token that has never had a known figure falls back
+# to when it was added, so "we have had no liquidity for this token since we
+# started watching it" is handled by the same rule rather than slipping
+# through a NULL comparison - which is exactly how Rule 1 ended up too broad.
+SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST = """
+update watchlists w
+   set is_active = false,
+       removed_at = now(),
+       notes = coalesce(w.notes || ' | ', '') || %s
+ where w.is_active
+   and w.added_at < now() - make_interval(hours => %s)
+   and coalesce(
+         (select max(s.captured_at)
+            from market_snapshots s
+           where s.token_id = w.token_id
+             and s.liquidity_usd is not null),
+         w.added_at
+       ) < now() - make_interval(hours => %s)
+returning w.id, w.token_id
+"""
+
+
 # Rule 2: it has been watched for days and has never done anything.
 #
 # The arrival event is excluded from the "did anything happen" test because
@@ -1165,6 +1205,15 @@ class Repository:
                         (note, grace_hours, below_usd))
             return list(cur.fetchall())
 
+    def retire_unknown_liquidity(
+        self, *, grace_hours: int, unknown_for_hours: int, note: str
+    ) -> list[tuple[int, int]]:
+        """Retire entries with no readable liquidity for a long time."""
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST,
+                        (note, grace_hours, unknown_for_hours))
+            return list(cur.fetchall())
+
     def retire_uneventful(
         self, *, older_than_hours: int, note: str, arrival_event_type: str
     ) -> list[tuple[int, int]]:
@@ -1347,6 +1396,7 @@ ALL_STATEMENTS: dict[str, str] = {
     "SQL_DATABASE_SIZE": SQL_DATABASE_SIZE,
     "SQL_LAST_SYSTEM_ALERT": SQL_LAST_SYSTEM_ALERT,
     "SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST": SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST,
+    "SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST": SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST,
     "SQL_RETIRE_UNEVENTFUL_WATCHLIST": SQL_RETIRE_UNEVENTFUL_WATCHLIST,
     "SQL_NEW_TOKEN_LIQUIDITY_SAMPLE": SQL_NEW_TOKEN_LIQUIDITY_SAMPLE,
     "SQL_SUMMARY_RUN_TOTALS": SQL_SUMMARY_RUN_TOTALS,

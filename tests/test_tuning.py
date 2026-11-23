@@ -28,10 +28,11 @@ def settings(**overrides: Any) -> Settings:
 
 
 class FakeRepo:
-    def __init__(self, low: int = 0, uneventful: int = 0,
+    def __init__(self, low: int = 0, uneventful: int = 0, unknown: int = 0,
                  failing: set[str] | None = None) -> None:
         self._low = low
         self._uneventful = uneventful
+        self._unknown = unknown
         self.failing = failing or set()
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -40,6 +41,12 @@ class FakeRepo:
         if "low" in self.failing:
             raise RuntimeError("simulated failure")
         return [(i, i) for i in range(self._low)]
+
+    def retire_unknown_liquidity(self, **kwargs):
+        self.calls.append(("unknown", kwargs))
+        if "unknown" in self.failing:
+            raise RuntimeError("simulated failure")
+        return [(i, i) for i in range(self._unknown)]
 
     def retire_uneventful(self, **kwargs):
         self.calls.append(("uneventful", kwargs))
@@ -95,12 +102,13 @@ class TestNewTokenFloor:
 
 class TestRetirement:
     def test_both_rules_run_and_are_counted_separately(self):
-        repo = FakeRepo(low=4, uneventful=3)
+        repo = FakeRepo(low=4, uneventful=3, unknown=9)
         result = retire_quiet_entries(settings(), repo)
         assert result.low_liquidity == 4
+        assert result.unknown_liquidity == 9
         assert result.uneventful == 3
-        assert result.total == 7
-        assert [name for name, _ in repo.calls] == ["low", "uneventful"]
+        assert result.total == 16
+        assert [name for name, _ in repo.calls] == ["low", "unknown", "uneventful"]
 
     def test_the_configured_thresholds_are_passed_through(self):
         repo = FakeRepo()
@@ -113,7 +121,7 @@ class TestRetirement:
         low = dict(repo.calls[0][1])
         assert low["below_usd"] == 3_500.0
         assert low["grace_hours"] == 8
-        assert dict(repo.calls[1][1])["older_than_hours"] == 96
+        assert dict(repo.calls[2][1])["older_than_hours"] == 96
 
     def test_disabling_it_touches_nothing(self):
         """An operator who turns this off must get no retirements at all,
@@ -131,10 +139,10 @@ class TestRetirement:
 
     def test_a_failure_is_reported_rather_than_raised(self):
         """Housekeeping must never take down a scanner pass."""
-        repo = FakeRepo(failing={"low", "uneventful"})
+        repo = FakeRepo(failing={"low", "unknown", "uneventful"})
         result = retire_quiet_entries(settings(), repo)   # must not raise
         assert result.total == 0
-        assert len(result.errors) == 2
+        assert len(result.errors) == 3
 
     def test_the_note_explains_why_a_row_was_retired(self):
         """Whoever finds a retired row months later needs to know what
@@ -143,7 +151,7 @@ class TestRetirement:
         retire_quiet_entries(settings(watchlist_retire_below_liquidity_usd=2_000.0,
                                       watchlist_retire_uneventful_hours=72), repo)
         assert "$2,000" in repo.calls[0][1]["note"]
-        assert "72h" in repo.calls[1][1]["note"]
+        assert "72h" in repo.calls[2][1]["note"]
 
     def test_a_grace_period_under_an_hour_is_rejected(self):
         """A brand-new pool is still filling. Retiring it on arrival would
@@ -226,7 +234,7 @@ class TestRetirementSqlShape:
 
         repo = FakeRepo()
         retire_quiet_entries(settings(), repo)
-        assert repo.calls[1][1]["arrival_event_type"] == FIRST_SEEN_EVENT_TYPE
+        assert repo.calls[2][1]["arrival_event_type"] == FIRST_SEEN_EVENT_TYPE
 
     def test_the_liquidity_sample_does_not_join_through_snapshot_id(self):
         """`snapshot_id` is null whenever the write policy skipped the
@@ -424,3 +432,61 @@ class TestFloorsAreRelated:
             watchlist_min_liquidity_usd=25_000.0,
             watchlist_retire_below_liquidity_usd=12_000.0))
         assert not any("RETIRE_BELOW_LIQUIDITY_USD" in p for p in problems)
+
+
+class TestUnknownLiquidityRule:
+    """Rule 1 never retires on unknown liquidity, because a pool being pulled
+    is the moment you most want to be watching. That was right for the first
+    few hours and wrong as a permanent exemption.
+
+    The measurement that proved it: 990 of 1,859 active entries - 53% - had
+    unknown liquidity. Not a rare emergency; the ordinary end state of a dead
+    token. No adjustment to the other thresholds could have fixed that,
+    because none of them could ever touch those rows.
+    """
+
+    def test_it_runs_and_is_counted_separately(self):
+        repo = FakeRepo(unknown=990)
+        result = retire_quiet_entries(settings(), repo)
+        assert result.unknown_liquidity == 990
+        assert "990 unreadable" in result.summary()
+
+    def test_recently_unknown_is_still_protected(self):
+        """The signal Rule 1 exists for survives: the SQL only retires once
+        liquidity has been unreadable for the configured window, so a pool
+        that just vanished from the feed is untouched."""
+        from mihq.db.repositories import SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+
+        sql = SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+        assert "max(s.captured_at)" in sql
+        assert "s.liquidity_usd is not null" in sql
+        assert sql.count("make_interval(hours =>") == 2   # grace AND window
+
+    def test_a_token_that_never_had_a_figure_falls_back_to_when_it_was_added(self):
+        """Without the COALESCE the subquery returns NULL, the comparison is
+        NULL, and the row is never retired - the same NULL trap that made
+        Rule 1 too broad in the first place."""
+        from mihq.db.repositories import SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+
+        assert "coalesce(" in SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+        assert "w.added_at" in SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+
+    def test_the_configured_window_is_passed_through(self):
+        repo = FakeRepo()
+        retire_quiet_entries(
+            settings(watchlist_retire_unknown_after_hours=36), repo)
+        assert dict(repo.calls[1][1])["unknown_for_hours"] == 36
+
+    def test_the_note_says_why(self):
+        repo = FakeRepo()
+        retire_quiet_entries(
+            settings(watchlist_retire_unknown_after_hours=24), repo)
+        assert "unreadable for 24h" in repo.calls[1][1]["note"]
+
+    def test_it_deactivates_rather_than_deletes(self):
+        from mihq.db.repositories import SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+
+        sql = SQL_RETIRE_UNKNOWN_LIQUIDITY_WATCHLIST
+        assert "delete" not in sql.lower()
+        assert "is_active = false" in sql
+        assert "removed_at = now()" in sql

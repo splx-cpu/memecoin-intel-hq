@@ -15,15 +15,21 @@ explaining why. The history stays, the research record stays, and because the
 unique index covers only ACTIVE rows, discovery can re-add the same token
 later if it comes back to life. Nothing here is irreversible.
 
-THE RULE THAT IS NOT APPLIED, AND WHY
--------------------------------------
-There is no rule that retires a token whose liquidity became UNKNOWN. That
-looks like an obvious case - no data, stop watching - and it is exactly
-backwards. Liquidity vanishing from a provider's feed is one of the strongest
-signals the system has: it may be the pool being pulled. `liquidity_unreported`
-exists precisely to alert on it. Retiring at that moment would drop the token
-at the moment it became worth watching, and the SQL's NULL comparison is what
-prevents it.
+UNKNOWN LIQUIDITY: THE CORRECTION
+---------------------------------
+Rule 1 never retires a token whose liquidity is unknown, because liquidity
+vanishing from the feed may be a pool being pulled - the moment you most want
+to still be watching. That is right for the first few hours.
+
+It was wrong as a permanent exemption, and the data said so: 990 of 1,859
+active entries (53%) had unknown liquidity. It is not a rare emergency, it is
+the ordinary end state of a dead token - it drops out of the provider feed and
+never comes back. The protection was pinning half the watchlist in place
+forever, and no adjustment to the other thresholds could have fixed it.
+
+Rule 3 resolves the tension by splitting it in time rather than in kind:
+recently unknown is a signal and is protected; unknown for a day is a dead
+token and is retired. `liquidity_unreported` has long since alerted by then.
 """
 
 from __future__ import annotations
@@ -41,16 +47,19 @@ log = get_logger(__name__)
 @dataclass
 class RetirementResult:
     low_liquidity: int = 0
+    unknown_liquidity: int = 0
     uneventful: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
-        return self.low_liquidity + self.uneventful
+        return self.low_liquidity + self.unknown_liquidity + self.uneventful
 
     def summary(self) -> str:
         return (f"retired {self.total} watchlist entries "
-                f"({self.low_liquidity} drained, {self.uneventful} uneventful)")
+                f"({self.low_liquidity} drained, "
+                f"{self.unknown_liquidity} unreadable, "
+                f"{self.uneventful} uneventful)")
 
 
 def retire_quiet_entries(settings: Settings, repo: Repository) -> RetirementResult:
@@ -78,6 +87,20 @@ def retire_quiet_entries(settings: Settings, repo: Repository) -> RetirementResu
                               # down a scanner pass
         result.errors.append(f"low-liquidity retirement: {exc}")
         log.warning("low-liquidity retirement failed", extra={"error": str(exc)})
+
+    note = (f"retired: liquidity unreadable for "
+            f"{settings.watchlist_retire_unknown_after_hours}h")
+    try:
+        rows = repo.retire_unknown_liquidity(
+            grace_hours=settings.watchlist_retire_grace_hours,
+            unknown_for_hours=settings.watchlist_retire_unknown_after_hours,
+            note=note,
+        )
+        result.unknown_liquidity = len(rows)
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"unknown-liquidity retirement: {exc}")
+        log.warning("unknown-liquidity retirement failed",
+                    extra={"error": str(exc)})
 
     note = (f"retired: no events in "
             f"{settings.watchlist_retire_uneventful_hours}h")

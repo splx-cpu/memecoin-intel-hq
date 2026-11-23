@@ -259,6 +259,12 @@ class Settings:
     # related.
     watchlist_retire_below_liquidity_usd: float = 5_000.0
     watchlist_retire_grace_hours: int = 6
+    # How long liquidity may stay unreadable before the token is retired.
+    #
+    # Long enough that a provider blip or a brief outage does not drop a live
+    # token; short enough that the ordinary dead-token end state clears. The
+    # `liquidity_unreported` alert has already fired well before this.
+    watchlist_retire_unknown_after_hours: int = 24
     watchlist_retire_uneventful_hours: int = 72
 
     # --- Event detection thresholds (see mihq.events.detectors) ---------
@@ -400,6 +406,8 @@ def load_settings(env_path: Path | str | None = None, *, override: bool = False)
         watchlist_retire_below_liquidity_usd=_get_float(
             "WATCHLIST_RETIRE_BELOW_LIQUIDITY_USD", 5_000.0),
         watchlist_retire_grace_hours=_get_int("WATCHLIST_RETIRE_GRACE_HOURS", 6),
+        watchlist_retire_unknown_after_hours=_get_int(
+            "WATCHLIST_RETIRE_UNKNOWN_AFTER_HOURS", 24),
         watchlist_retire_uneventful_hours=_get_int(
             "WATCHLIST_RETIRE_UNEVENTFUL_HOURS", 72),
         event_min_liquidity_usd=_get_float("EVENT_MIN_LIQUIDITY_USD", 5_000.0),
