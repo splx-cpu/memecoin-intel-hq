@@ -245,7 +245,19 @@ class Settings:
     watchlist_readd_cooldown_hours: int = 168   # one week
 
     watchlist_retire_enabled: bool = True
-    watchlist_retire_below_liquidity_usd: float = 2_000.0
+    # Deliberately BELOW the entry floor, not equal to it, and deliberately
+    # not far below.
+    #
+    # The gap between the two is hysteresis: a token hovering at the boundary
+    # is neither added nor retired, instead of bouncing between the two states
+    # every pass. Half the entry floor gives a sensible band.
+    #
+    # The first version used $2,000 against a $10,000 entry floor, which left
+    # an $8,000 dead zone: tokens that had sagged well below the level that
+    # would get them added today, yet nothing ever removed them. The watchlist
+    # grew from 1,717 to 1,859 overnight because of it. Keep these two numbers
+    # related.
+    watchlist_retire_below_liquidity_usd: float = 5_000.0
     watchlist_retire_grace_hours: int = 6
     watchlist_retire_uneventful_hours: int = 72
 
@@ -386,7 +398,7 @@ def load_settings(env_path: Path | str | None = None, *, override: bool = False)
             "WATCHLIST_READD_COOLDOWN_HOURS", 168),
         watchlist_retire_enabled=_get_bool("WATCHLIST_RETIRE_ENABLED", True),
         watchlist_retire_below_liquidity_usd=_get_float(
-            "WATCHLIST_RETIRE_BELOW_LIQUIDITY_USD", 2_000.0),
+            "WATCHLIST_RETIRE_BELOW_LIQUIDITY_USD", 5_000.0),
         watchlist_retire_grace_hours=_get_int("WATCHLIST_RETIRE_GRACE_HOURS", 6),
         watchlist_retire_uneventful_hours=_get_int(
             "WATCHLIST_RETIRE_UNEVENTFUL_HOURS", 72),
@@ -492,6 +504,18 @@ def validate_settings(settings: Settings, stages: tuple[str, ...] = ("database",
             f"{settings.event_new_token_min_liquidity_usd}; expected a "
             f"positive number. Set it to the smallest pool you want to hear "
             f"about at all."
+        )
+
+    if (settings.watchlist_retire_below_liquidity_usd
+            >= settings.watchlist_min_liquidity_usd > 0):
+        problems.append(
+            f"WATCHLIST_RETIRE_BELOW_LIQUIDITY_USD is "
+            f"{settings.watchlist_retire_below_liquidity_usd:,.0f} but tokens "
+            f"are only added above "
+            f"{settings.watchlist_min_liquidity_usd:,.0f}. A token would "
+            f"qualify for retirement the moment it was added. Set the "
+            f"retirement floor below the entry floor - about half is a "
+            f"reasonable gap."
         )
 
     if settings.watchlist_retire_grace_hours < 1:

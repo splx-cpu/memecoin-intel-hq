@@ -386,3 +386,41 @@ class TestReAddCooldown:
             repo, FakeGecko({"base": [observation(price_usd=1.0)], "solana": []}),
         ).run_once()
         assert captured["readd_cooldown_hours"] == 240
+
+
+class TestFloorsAreRelated:
+    """The watchlist grew 1,717 -> 1,859 overnight because the entry floor
+    ($10,000) and the retirement floor ($2,000) were set in different
+    sessions and never related to each other. Everything between them was
+    dead money that nothing would add today and nothing ever removed.
+    """
+
+    def test_the_retirement_floor_sits_below_the_entry_floor(self):
+        s = settings()
+        assert s.watchlist_retire_below_liquidity_usd < s.watchlist_min_liquidity_usd
+
+    def test_the_gap_is_not_so_wide_it_leaves_a_dead_zone(self):
+        """Hysteresis, not a chasm. Anything much below half the entry floor
+        starts accumulating entries that will never be removed."""
+        s = settings()
+        ratio = (s.watchlist_retire_below_liquidity_usd
+                 / s.watchlist_min_liquidity_usd)
+        assert 0.4 <= ratio < 1.0
+
+    def test_a_retirement_floor_at_or_above_the_entry_floor_is_rejected(self):
+        """A token would qualify for retirement the instant it was added,
+        and with the re-add cooldown it would then be locked out for a week."""
+        from mihq.config import validate_settings
+
+        problems = validate_settings(settings(
+            watchlist_min_liquidity_usd=10_000.0,
+            watchlist_retire_below_liquidity_usd=10_000.0))
+        assert any("RETIRE_BELOW_LIQUIDITY_USD" in p for p in problems)
+
+    def test_a_sensible_pair_is_accepted(self):
+        from mihq.config import validate_settings
+
+        problems = validate_settings(settings(
+            watchlist_min_liquidity_usd=25_000.0,
+            watchlist_retire_below_liquidity_usd=12_000.0))
+        assert not any("RETIRE_BELOW_LIQUIDITY_USD" in p for p in problems)

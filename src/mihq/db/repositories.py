@@ -433,6 +433,55 @@ select flag_type, severity, detail, evidence, detected_at
 """
 
 
+# Why is each active watchlist entry still here? One row, so the answer is a
+# single round trip rather than a scan of the whole table.
+#
+# This exists because the first set of retirement thresholds did not converge
+# and it was not obvious which of the two rules was failing. Guessing at
+# thresholds without this is how the dead zone below got created in the first
+# place.
+SQL_WATCHLIST_DIAGNOSIS = """
+with active as (
+    select w.id, w.token_id, w.added_at,
+           (select s.liquidity_usd
+              from market_snapshots s
+             where s.token_id = w.token_id
+             order by s.captured_at desc
+             limit 1) as liquidity_usd
+      from watchlists w
+     where w.is_active
+)
+select
+    count(*)                                                       as total,
+    count(*) filter (where added_at > now() - make_interval(hours => %s))
+                                                                   as in_grace,
+    count(*) filter (where liquidity_usd is null)                  as unknown_liq,
+    count(*) filter (where liquidity_usd < %s)                     as below_retire,
+    count(*) filter (where liquidity_usd >= %s and liquidity_usd < %s)
+                                                                   as dead_zone,
+    count(*) filter (where liquidity_usd >= %s)                    as above_entry,
+    count(*) filter (where added_at < now() - make_interval(hours => %s))
+                                                                   as old_enough,
+    count(*) filter (where exists (
+        select 1 from alert_events e
+         where e.token_id = active.token_id and e.event_type <> %s))
+                                                                   as has_events
+  from active
+"""
+
+# Which event types are keeping tokens alive under the "uneventful" rule.
+# If one noisy detector fires for most of the watchlist, that rule can never
+# retire anything and the whole mechanism is inert.
+SQL_WATCHLIST_EVENT_TYPES = """
+select e.event_type, count(distinct e.token_id)
+  from alert_events e
+  join watchlists w on w.token_id = e.token_id and w.is_active
+ where e.event_type <> %s
+ group by e.event_type
+ order by 2 desc
+"""
+
+
 # ---------------------------------------------------------------------------
 # health
 # ---------------------------------------------------------------------------
@@ -1138,6 +1187,24 @@ class Repository:
             cur.execute(SQL_NEW_TOKEN_LIQUIDITY_SAMPLE, (arrival_event_type, since))
             return [float(r[0]) for r in cur.fetchall() if r[0] is not None]
 
+    def watchlist_diagnosis(
+        self, *, grace_hours: int, retire_floor: float, entry_floor: float,
+        uneventful_hours: int, arrival_event_type: str,
+    ) -> dict[str, int]:
+        cols = ("total", "in_grace", "unknown_liq", "below_retire", "dead_zone",
+                "above_entry", "old_enough", "has_events")
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_WATCHLIST_DIAGNOSIS,
+                        (grace_hours, retire_floor, retire_floor, entry_floor,
+                         entry_floor, uneventful_hours, arrival_event_type))
+            row = cur.fetchone()
+        return dict(zip(cols, (int(v or 0) for v in row))) if row else {}
+
+    def watchlist_event_types(self, arrival_event_type: str) -> list[tuple[str, int]]:
+        with self.conn.cursor() as cur:
+            cur.execute(SQL_WATCHLIST_EVENT_TYPES, (arrival_event_type,))
+            return [(r[0], int(r[1])) for r in cur.fetchall()]
+
     # -- health ----------------------------------------------------------
 
     def database_size_bytes(self) -> int:
@@ -1275,6 +1342,8 @@ ALL_STATEMENTS: dict[str, str] = {
     "SQL_UPSERT_RISK_FLAG": SQL_UPSERT_RISK_FLAG,
     "SQL_RESOLVE_ABSENT_RISK_FLAGS": SQL_RESOLVE_ABSENT_RISK_FLAGS,
     "SQL_ACTIVE_RISK_FLAGS": SQL_ACTIVE_RISK_FLAGS,
+    "SQL_WATCHLIST_DIAGNOSIS": SQL_WATCHLIST_DIAGNOSIS,
+    "SQL_WATCHLIST_EVENT_TYPES": SQL_WATCHLIST_EVENT_TYPES,
     "SQL_DATABASE_SIZE": SQL_DATABASE_SIZE,
     "SQL_LAST_SYSTEM_ALERT": SQL_LAST_SYSTEM_ALERT,
     "SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST": SQL_RETIRE_LOW_LIQUIDITY_WATCHLIST,
